@@ -43,6 +43,7 @@ public class BmsApiServer {
 	private static final Deque<BmsEvent> events = new ArrayDeque<>();
 	private static final Set<Integer> allowedModules = new HashSet<>();
 	private static final Map<Integer, Map<String, Double>> cellSettingsByModule = new ConcurrentHashMap<>();
+	private static final Map<String, IngestSourceState> ingestSources = new ConcurrentHashMap<>();
 
 	private static final SettingDefinition[] SETTING_DEFINITIONS = new SettingDefinition[] {
 		new SettingDefinition("fully_charged_voltage_v", "Fully Charged Voltage", "V", 3.0, 4.5, 4.2, true),
@@ -358,7 +359,13 @@ public class BmsApiServer {
 	}
 
 	private static void persistIngestSource(String sourceAddr, int acceptedCount, int heartbeatCount, String lastPayload, int lastModuleId) {
-		if (dbConnection == null || sourceAddr == null || sourceAddr.isBlank() || (acceptedCount <= 0 && heartbeatCount <= 0)) {
+		if (sourceAddr == null || sourceAddr.isBlank() || (acceptedCount <= 0 && heartbeatCount <= 0)) {
+			return;
+		}
+
+		updateIngestSourceMemory(sourceAddr, acceptedCount, lastPayload, lastModuleId);
+
+		if (dbConnection == null) {
 			return;
 		}
 
@@ -381,6 +388,23 @@ public class BmsApiServer {
 		} catch (Exception ex) {
 			System.err.println("[BmsApiServer] Failed to persist ingest source: " + ex.getMessage());
 		}
+	}
+
+	private static void updateIngestSourceMemory(String sourceAddr, int acceptedCount, String lastPayload, int lastModuleId) {
+		ingestSources.compute(sourceAddr, (key, current) -> {
+			IngestSourceState state = current == null ? new IngestSourceState() : current;
+			state.lastSeen = Instant.now();
+			if (acceptedCount > 0) {
+				state.acceptedCount += acceptedCount;
+			}
+			if (lastModuleId > 0) {
+				state.lastModuleId = lastModuleId;
+			}
+			if (lastPayload != null && !lastPayload.isBlank()) {
+				state.lastPayload = lastPayload;
+			}
+			return state;
+		});
 	}
 
 	private static BmsReading parseBms(String line) {
@@ -1066,6 +1090,55 @@ public class BmsApiServer {
 				} catch (Exception ex) {
 					System.err.println("[BmsApiServer] Failed loading RPi sources from DB: " + ex.getMessage());
 				}
+			} else {
+				List<Map.Entry<String, IngestSourceState>> sourceEntries = new ArrayList<>(ingestSources.entrySet());
+				sourceEntries.sort((a, b) -> {
+					Instant aSeen = a.getValue() == null ? null : a.getValue().lastSeen;
+					Instant bSeen = b.getValue() == null ? null : b.getValue().lastSeen;
+					if (aSeen == null && bSeen == null) {
+						return 0;
+					}
+					if (aSeen == null) {
+						return 1;
+					}
+					if (bSeen == null) {
+						return -1;
+					}
+					return bSeen.compareTo(aSeen);
+				});
+
+				int max = Math.min(sourceEntries.size(), 20);
+				for (int i = 0; i < max; i++) {
+					Map.Entry<String, IngestSourceState> entry = sourceEntries.get(i);
+					String source = entry.getKey();
+					IngestSourceState state = entry.getValue();
+					if (state == null) {
+						continue;
+					}
+
+					long seconds = state.lastSeen == null ? Long.MAX_VALUE : secondsSince(state.lastSeen);
+					boolean online = seconds <= offlineThresholdSec;
+					if (online) {
+						anyOnline = true;
+					}
+
+					if (!firstSource) {
+						sourcesJson.append(',');
+					}
+					firstSource = false;
+
+					sourcesJson.append("{\"source\":\"").append(escapeJson(source)).append("\"");
+					sourcesJson.append(",\"lastSeen\":\"").append(state.lastSeen == null ? "" : escapeJson(state.lastSeen.toString())).append("\"");
+					sourcesJson.append(",\"secondsSinceSeen\":").append(seconds == Long.MAX_VALUE ? -1 : seconds);
+					sourcesJson.append(",\"online\":").append(online);
+					sourcesJson.append(",\"acceptedCount\":").append(state.acceptedCount);
+					if (state.lastModuleId > 0) {
+						sourcesJson.append(",\"lastModuleId\":").append(state.lastModuleId);
+					} else {
+						sourcesJson.append(",\"lastModuleId\":null");
+					}
+					sourcesJson.append(",\"lastPayload\":\"").append(escapeJson(state.lastPayload)).append("\"}");
+				}
 			}
 			sourcesJson.append(']');
 
@@ -1457,6 +1530,13 @@ public class BmsApiServer {
 		static IngestResult rejected() {
 			return new IngestResult(false, false, 0, "");
 		}
+	}
+
+	private static class IngestSourceState {
+		Instant lastSeen;
+		long acceptedCount;
+		int lastModuleId;
+		String lastPayload = "";
 	}
 
 	private static class SettingDefinition {
